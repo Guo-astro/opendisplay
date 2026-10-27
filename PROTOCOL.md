@@ -114,6 +114,14 @@ the cable through Android Open Accessory (AOA), which works on any Android
 device with no developer settings. The byte stream is exactly the one
 described in this document, and the receiver opens it with `hello`.
 
+These control requests are vendor requests, and devices other than Android
+may act on them: a USB Ethernet chip common in docks drops its network link
+on `GET_PROTOCOL`. So a sender MUST NOT ask a device that has not answered
+before unless it exposes an Android USB function: an adb interface
+(`FF/42/01`) or an interface whose name contains `MTP` (`06/01/01`, or
+`FF/FF/00` on older kernels). A stall during discovery is final for that
+attachment.
+
 The sender sends the Android Open Accessory control requests
 (`GET_PROTOCOL` 51, `SEND_STRING` 52, `START` 53) with this identity:
 
