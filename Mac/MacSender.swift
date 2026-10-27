@@ -814,13 +814,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         try ensureActiveDisplay(vd)
         var captureDisplay = display
         if requestedCanvas != bootstrapCanvas {
-            let promoted = await MainActor.run {
-                guard !self.stopped, self.virtualDisplay === vd else { return false }
-                return vd.resize(pointsWide: requestedCanvas.pointsWide,
-                                 pointsHigh: requestedCanvas.pointsHigh,
-                                 movingTo: DisplayArrangement.origin(for: requestedCanvas.cgSize,
-                                                                     device: arrangementKey))
-            }
+            let promoted = await resizeInPlace(vd, pointsWide: requestedCanvas.pointsWide,
+                                               pointsHigh: requestedCanvas.pointsHigh,
+                                               arrangementKey: arrangementKey)
             try ensureActiveDisplay(vd)
             if promoted {
                 do {
@@ -835,13 +831,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     if error is CancellationError { throw error }
                     Log.info("large virtual display mode did not come online (\(error)) — "
                         + "continuing with a \(bootstrapCanvas.pixelsWide)x\(bootstrapCanvas.pixelsHigh) desktop canvas")
-                    let rolledBack = await MainActor.run {
-                        guard !self.stopped, self.virtualDisplay === vd else { return false }
-                        return vd.resize(pointsWide: bootstrapCanvas.pointsWide,
-                                         pointsHigh: bootstrapCanvas.pointsHigh,
-                                         movingTo: DisplayArrangement.origin(for: bootstrapCanvas.cgSize,
-                                                                             device: arrangementKey))
-                    }
+                    let rolledBack = await resizeInPlace(vd, pointsWide: bootstrapCanvas.pointsWide,
+                                                         pointsHigh: bootstrapCanvas.pointsHigh,
+                                                         arrangementKey: arrangementKey)
                     try ensureActiveDisplay(vd)
                     guard rolledBack else { throw error }
                     captureDisplay = try await findSCDisplay(
@@ -875,6 +867,50 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// constraints. Loops until the stream matches the latest hello, so a
     /// capability update that arrives mid-rebuild is not lost.
     private var reconfiguring = false
+    /// The rebuild waiting out a burst of hellos; replaced by each new one.
+    private var pendingReconfigure: Task<Void, Never>?
+    private var lastSelectionChange: ContinuousClock.Instant?
+    /// When the latest selection change may be built: 25 ms after a lone
+    /// change, 150 ms after the last change of a burst. Confined to `queue`,
+    /// like the two above.
+    private var selectionSettlesAt = ContinuousClock.now
+
+    /// A lone change (a fold, a single rotation) rebuilds almost at once:
+    /// every millisecond here is a stale picture on the receiver. The 25 ms
+    /// grace lets a change a receiver announces in several hellos sent back
+    /// to back (a new refresh rate, then the new size) land as one rebuild.
+    /// A burst (a quick double rotation, a live window resize) waits until
+    /// it settles. `reconfigure` itself picks up hellos that land while it
+    /// runs, under the same rule.
+    private func scheduleReconfigure() {
+        // Part of the change already waiting out its grace: that rebuild
+        // reads the latest hello when it starts.
+        guard let wait = noteSelectionChange() else { return }
+        pendingReconfigure?.cancel()
+        pendingReconfigure = Task {
+            try? await Task.sleep(for: wait)
+            guard !Task.isCancelled else { return }
+            guard let current = self.lastHello else { return }
+            // Its own task: cancelling the wait must never abort a rebuild
+            // that already tore the old stream down.
+            Task { await self.reconfigure(current) }
+        }
+    }
+
+    /// Starts the settle clock for a selection change and returns its wait,
+    /// or nil when the change is part of one still inside its grace. Hellos
+    /// that land mid-rebuild, while no stream exists, only start the clock:
+    /// `reconfigure` builds them after its pass, once they settle.
+    private func noteSelectionChange() -> Duration? {
+        let now = ContinuousClock.now
+        if let last = lastSelectionChange, now - last < .milliseconds(25) { return nil }
+        let isLoneChange = lastSelectionChange.map { now - $0 > .milliseconds(500) } ?? true
+        let wait: Duration = isLoneChange ? .milliseconds(25) : .milliseconds(150)
+        lastSelectionChange = now
+        selectionSettlesAt = now + wait
+        return wait
+    }
+
     private func reconfigure(_ info: PhoneInfo) async {
         guard !reconfiguring, !stopped else { return }
         reconfiguring = true
@@ -923,13 +959,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 await status("Stream reconfiguration failed: \(error.localizedDescription)")
                 return
             }
-            if let latest = lastHello,
-               streamSelectionInputsChanged(from: target, to: latest) || canvasNeedsRebuild {
-                canvasNeedsRebuild = false
-                target = latest
-                continue
+            guard let pending = lastHello,
+                  streamSelectionInputsChanged(from: target, to: pending) || canvasNeedsRebuild else { return }
+            // A burst that outlasts a pass (a Stage Manager drag) settles
+            // first, as in scheduleReconfigure: every pass rebuilds the
+            // display and can rearrange the Mac's windows, so jumping to each
+            // newest hello would rebuild at sizes the user only passes through.
+            await waitForSelectionToSettle()
+            guard let latest = lastHello,
+                  streamSelectionInputsChanged(from: target, to: latest) || canvasNeedsRebuild else { return }
+            canvasNeedsRebuild = false
+            target = latest
+        }
+    }
+
+    private func waitForSelectionToSettle() async {
+        while !stopped {
+            let settlesAt = await withCheckedContinuation { continuation in
+                queue.async { continuation.resume(returning: self.selectionSettlesAt) }
             }
-            return
+            guard settlesAt > .now else { return }
+            do { try await Task.sleep(until: settlesAt, clock: .continuous) } catch { return }
         }
     }
 
@@ -985,12 +1035,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let dimensionsChanged = vd.pointsWide != pointsWide || vd.pointsHigh != pointsHigh
             || vd.scale != scale
         let didResize = if dimensionsChanged {
-            await MainActor.run {
-                guard !self.stopped, self.virtualDisplay === vd else { return false }
-                return vd.resize(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale,
-                                 movingTo: DisplayArrangement.origin(for: size,
-                                                                     device: arrangementKey))
-            }
+            await resizeInPlace(vd, pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale,
+                                arrangementKey: arrangementKey)
         } else {
             true
         }
@@ -1014,14 +1060,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                   !(nsError.domain == "MacSender" && nsError.code == 4) else { throw error }
             Log.info("virtual display mode \(canvas.pixelsWide)x\(canvas.pixelsHigh) did not come online "
                 + "(\(error)) — rolling back to \(previous.pixelsWide)x\(previous.pixelsHigh)")
-            let rolledBack = await MainActor.run {
-                guard !self.stopped, self.virtualDisplay === vd else { return false }
-                return vd.resize(pointsWide: previous.pointsWide,
-                                 pointsHigh: previous.pointsHigh,
-                                 scale: previous.scale,
-                                 movingTo: DisplayArrangement.origin(for: previous.cgSize,
-                                                                     device: arrangementKey))
-            }
+            let rolledBack = await resizeInPlace(vd, pointsWide: previous.pointsWide,
+                                                 pointsHigh: previous.pointsHigh,
+                                                 scale: previous.scale,
+                                                 arrangementKey: arrangementKey)
             try ensureActiveDisplay(vd)
             guard rolledBack else { return false }
             return try await resumeExistingCanvas(vd, canvas: previous,
@@ -1077,6 +1119,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 + "\(canvas.pixelsWide)x\(canvas.pixelsHigh) (\(error))")
             return false
         }
+    }
+
+    /// Apply a new mode to this session's display, unless the session has
+    /// stopped or moved on to another display.
+    @MainActor
+    private func resizeInPlace(_ vd: VirtualDisplay, pointsWide: Int, pointsHigh: Int,
+                               scale: Int? = nil, arrangementKey: String) async -> Bool {
+        guard !stopped, virtualDisplay === vd else { return false }
+        let origin = DisplayArrangement.origin(for: CGSize(width: pointsWide, height: pointsHigh),
+                                               device: arrangementKey, resizing: vd.displayID)
+        return await vd.resize(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale,
+                               movingTo: origin,
+                               stillCurrent: { !self.stopped && self.virtualDisplay === vd })
     }
 
     private func ensureActiveDisplay(_ display: VirtualDisplay) throws {
@@ -1359,6 +1414,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self?.stopUpgradeProbing()
             self?.captureRecoveryWork?.cancel()
             self?.captureRecoveryWork = nil
+            // Scheduled from hello handling, which runs on `queue` too.
+            self?.pendingReconfigure?.cancel()
+            self?.pendingReconfigure = nil
         }
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
@@ -2507,17 +2565,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let continuation = helloContinuation {
                     helloContinuation = nil
                     continuation.resume(returning: info)
-                } else if stream != nil, let previous,
-                          streamSelectionInputsChanged(from: previous, to: info) {
-                    // Rebuild after a short debounce so a flurry of rotations
-                    // or capability updates settles into one selection.
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(300))
-                        guard let current = self.lastHello,
-                              !self.streamSelectionInputsChanged(from: info,
-                                                                 to: current) else { return }
-                        await self.reconfigure(info)
-                    }
+                } else if let previous, streamSelectionInputsChanged(from: previous, to: info) {
+                    if stream != nil { scheduleReconfigure() } else { _ = noteSelectionChange() }
                 }
             }
         case "touch":

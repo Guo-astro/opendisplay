@@ -302,7 +302,7 @@ Coordinates use the conventions of section 7.
 
 | `type` | Since | Fields | Purpose |
 |---|---|---|---|
-| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`? | Identify the panel and receiver video capabilities; (re)sent on connect and on rotation |
+| `hello` | pv 1 | `pixelsWide`, `pixelsHigh`, `scale`, `device`?, `id`?, `pv`?, `displayMaxFrameRate`?, `videoCaps`?, `panel`? | Identify the panel and receiver video capabilities; (re)sent on connect and whenever the panel changes |
 | `ping` | pv 1 | `t` | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `t`? | Finger input |
 | `scroll` | pv 1 | `dx`, `dy` | Two-finger scroll |
@@ -320,7 +320,8 @@ nothing before it arrives.
 * `pixelsWide`, `pixelsHigh` (int): **deprecated**, superseded by `panel`
   (section 6.7) and removed at the next `pv` bump. The desktop the receiver
   wants, as pixels of a 2x desktop, in the **current orientation**
-  (portrait swaps them). On iOS these are the physical pixels; the Mac
+  (portrait swaps them). On iOS these are the physical pixels of the
+  app's window (the whole panel when it fills the screen); the Mac
   receiver sends its point size x 2, which is its physical pixels only on
   a Retina panel. A sender that receives a valid `panel` ignores them.
 * `scale` (number): **deprecated** with them. The device's UI scale
@@ -356,10 +357,13 @@ nothing before it arrives.
   no bump.
 
 A receiver MUST re-send `hello` on the live connection whenever its
-announced dimensions change (rotation). The sender rebuilds the display in
-response; the official sender debounces this by 300 ms so an orientation
-flurry settles into one rebuild, and replies to *every* `hello` with a
-fresh `welcome` (receivers treat repeats idempotently).
+announced dimensions change (rotation, a fold, a window resize). The
+sender rebuilds the display in response; the official sender rebuilds
+25 ms after a lone change (hellos within those 25 ms count as the same
+change) and, for a burst (a change within 500 ms of the previous one),
+waits until 150 ms after the last so it settles into one rebuild. It
+replies to *every* `hello` with a fresh `welcome` (receivers treat
+repeats idempotently).
 
 **`ping`** carries `t` (number): milliseconds since the Unix epoch on the
 receiver's clock. The sender MUST reply with `pong` echoing `t` (section
@@ -580,7 +584,7 @@ desktop/quality policy, then reports the result with `streamConfig`.
 
 Every official receiver advertises H.264. A receiver with a hardware HEVC
 decoder also advertises HEVC: the Mac receiver up to 5120×2880 at 60 FPS, the
-iOS receiver up to its panel's long side on either axis at 60 FPS, within any
+iOS receiver up to its window's long side on either axis at 60 FPS, within any
 decode budget. HEVC is additive: a peer that ignores the new capability keeps
 H.264.
 
@@ -687,9 +691,13 @@ swaps every pair).
   size the receiver itself currently runs (a Mac's "looks like" display
   setting). Absent means the receiver has no such setting.
 
+A receiver that runs in a window smaller than its screen (iPad Split View
+or Stage Manager, one half of a foldable's split) reports that window's
+pixels, and a foldable reports the screen it is currently on.
+
 The receiver MUST re-send `hello` whenever any `panel` value changes
-(rotation, a display-mode change on a Mac), even if the deprecated fields
-did not change.
+(rotation, a fold or unfold, a window resize, a display-mode change on a
+Mac), even if the deprecated fields did not change.
 
 A sender uses `panel` only when `pixelsWide/High` are integers of at least
 2, `scale` is a finite number above 0, and `pointsWide/High` are both
